@@ -1,281 +1,212 @@
-// ============================================================
-// 🐼 时空机云端账号系统 V1.0
-// 平台：Vercel Serverless Functions
-// ============================================================
+const { Redis } = require('@upstash/redis');
 
-// ⚠️ 你的真实 API 密钥（后面会教你怎么安全地填）
+let redis;
+function getRedis() {
+    if (!redis) {
+        redis = Redis.fromEnv();
+    }
+    return redis;
+}
+
 const API_KEY = process.env.API_KEY || "";
 const API_URL = process.env.API_URL || "https://api.deepseek.com/v1/chat/completions";
 const API_MODEL = process.env.API_MODEL || "deepseek-chat";
 const DEFAULT_FREE_QUOTA = 100;
 
-// ========== 内存数据库（轻量版，后续可升级） ==========
-// 注意：Vercel 免费版每次冷启动会重置内存，
-// 所以我们用文件系统的 /tmp 目录做临时持久化
-const fs = require('fs');
-const path = require('path');
-const DB_PATH = '/tmp/shikongji_db.json';
-
-function loadDB() {
-  try {
-    if (fs.existsSync(DB_PATH)) {
-      return JSON.parse(fs.readFileSync(DB_PATH, 'utf8'));
-    }
-  } catch(e) {}
-  return { users: {}, tokens: {} };
-}
-
-function saveDB(db) {
-  try {
-    fs.writeFileSync(DB_PATH, JSON.stringify(db));
-  } catch(e) {}
-}
-
-// ========== 工具函数 ==========
 function simpleHash(str) {
-  let hash = 0;
-  const salt = "_SHIKONGJI_SALT_2026";
-  const data = str + salt;
-  for (let i = 0; i < data.length; i++) {
-    const char = data.charCodeAt(i);
-    hash = ((hash << 5) - hash) + char;
-    hash |= 0;
-  }
-  return Math.abs(hash).toString(36);
+    let hash = 0;
+    const data = str + "_SHIKONGJI_SALT_2026";
+    for (let i = 0; i < data.length; i++) {
+        hash = ((hash << 5) - hash) + data.charCodeAt(i);
+        hash |= 0;
+    }
+    return Math.abs(hash).toString(36);
 }
 
 function generateToken() {
-  return Math.random().toString(36).slice(2) + 
-         Math.random().toString(36).slice(2) + 
-         Date.now().toString(36);
+    return Math.random().toString(36).slice(2) +
+           Math.random().toString(36).slice(2) +
+           Date.now().toString(36);
 }
 
 function json(res, data, status = 200) {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-  res.setHeader('Content-Type', 'application/json');
-  res.status(status).json(data);
-}
-
-function getUser(req, db) {
-  const auth = req.headers.authorization;
-  if (!auth || !auth.startsWith('Bearer ')) return null;
-  const token = auth.substring(7);
-  const tokenData = db.tokens[token];
-  if (!tokenData) return null;
-  if (Date.now() > tokenData.expires) {
-    delete db.tokens[token];
-    return null;
-  }
-  const user = db.users[tokenData.username];
-  if (!user) return null;
-  return { ...user, username: tokenData.username };
-}
-
-// ========== 主处理函数 ==========
-module.exports = async function handler(req, res) {
-  // CORS 预检
-  if (req.method === 'OPTIONS') {
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-    return res.status(200).end();
-  }
+    res.setHeader('Content-Type', 'application/json');
+    res.status(status).json(data);
+}
 
-  const url = new URL(req.url, `http://${req.headers.host}`);
-  const pathname = url.pathname;
-  const db = loadDB();
+async function getUser(req) {
+    const auth = req.headers.authorization;
+    if (!auth || !auth.startsWith('Bearer ')) return null;
+    const token = auth.substring(7);
+    const db = getRedis();
+    const username = await db.get('token:' + token);
+    if (!username) return null;
+    const user = await db.get('user:' + username);
+    if (!user) return null;
+    return { ...user, username: username };
+}
 
-  try {
-    // ==========================================
-    //  📝 注册
-    // ==========================================
-    if (pathname === '/auth/register' && req.method === 'POST') {
-      const { username, password, nickname } = req.body || {};
-
-      if (!username || !password) {
-        return json(res, { error: "用户名和密码不能为空" }, 400);
-      }
-      if (username.length < 3 || username.length > 20) {
-        return json(res, { error: "用户名长度 3~20 字符" }, 400);
-      }
-      if (password.length < 6) {
-        return json(res, { error: "密码至少 6 位" }, 400);
-      }
-
-      const uname = username.toLowerCase();
-      if (db.users[uname]) {
-        return json(res, { error: "用户名已被占用" }, 409);
-      }
-
-      const pwdHash = simpleHash(password);
-      db.users[uname] = {
-        password_hash: pwdHash,
-        nickname: nickname || username,
-        created_at: new Date().toISOString(),
-        is_banned: false,
-        is_vip: false,
-        free_quota: DEFAULT_FREE_QUOTA,
-        used_quota: 0
-      };
-
-      const token = generateToken();
-      db.tokens[token] = {
-        username: uname,
-        expires: Date.now() + 30 * 24 * 60 * 60 * 1000
-      };
-
-      saveDB(db);
-
-      return json(res, {
-        success: true,
-        message: "注册成功！",
-        token: token,
-        user: {
-          username: uname,
-          nickname: nickname || username,
-          free_quota: DEFAULT_FREE_QUOTA,
-          used_quota: 0
-        }
-      });
+module.exports = async function handler(req, res) {
+    if (req.method === 'OPTIONS') {
+        res.setHeader('Access-Control-Allow-Origin', '*');
+        res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
+        res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+        return res.status(200).end();
     }
 
-    // ==========================================
-    //  🔑 登录
-    // ==========================================
-    if (pathname === '/auth/login' && req.method === 'POST') {
-      const { username, password } = req.body || {};
+    const url = new URL(req.url, `http://${req.headers.host}`);
+    const pathname = url.pathname;
+    const db = getRedis();
 
-      if (!username || !password) {
-        return json(res, { error: "请填写用户名和密码" }, 400);
-      }
+    try {
+        // 注册
+        if (pathname === '/auth/register' && req.method === 'POST') {
+            const { username, password, nickname } = req.body || {};
+            if (!username || !password) return json(res, { error: "用户名和密码不能为空" }, 400);
+            if (username.length < 3 || username.length > 20) return json(res, { error: "用户名长度 3~20 字符" }, 400);
+            if (password.length < 6) return json(res, { error: "密码至少 6 位" }, 400);
 
-      const uname = username.toLowerCase();
-      const user = db.users[uname];
-      const pwdHash = simpleHash(password);
+            const uname = username.toLowerCase();
+            const existing = await db.get('user:' + uname);
+            if (existing) return json(res, { error: "用户名已被占用" }, 409);
 
-      if (!user || user.password_hash !== pwdHash) {
-        return json(res, { error: "用户名或密码错误" }, 401);
-      }
-      if (user.is_banned) {
-        return json(res, { error: "该账号已被封禁" }, 403);
-      }
+            const pwdHash = simpleHash(password);
+            const userData = {
+                password_hash: pwdHash,
+                nickname: nickname || username,
+                free_quota: DEFAULT_FREE_QUOTA,
+                used_quota: 0
+            };
 
-      // 清理旧令牌
-      for (let t in db.tokens) {
-        if (db.tokens[t].username === uname) delete db.tokens[t];
-      }
+            await db.set('user:' + uname, JSON.stringify(userData));
 
-      const token = generateToken();
-      db.tokens[token] = {
-        username: uname,
-        expires: Date.now() + 30 * 24 * 60 * 60 * 1000
-      };
+            const token = generateToken();
+            await db.set('token:' + token, uname, { ex: 30 * 24 * 60 * 60 });
 
-      saveDB(db);
-
-      return json(res, {
-        success: true,
-        token: token,
-        user: {
-          username: uname,
-          nickname: user.nickname,
-          is_vip: !!user.is_vip,
-          free_quota: user.free_quota,
-          used_quota: user.used_quota
+            return json(res, {
+                success: true,
+                message: "注册成功！",
+                token: token,
+                user: {
+                    username: uname,
+                    nickname: userData.nickname,
+                    free_quota: DEFAULT_FREE_QUOTA,
+                    used_quota: 0
+                }
+            });
         }
-      });
-    }
 
-    // ==========================================
-    //  👤 获取当前用户信息
-    // ==========================================
-    if (pathname === '/auth/me' && req.method === 'GET') {
-      const user = getUser(req, db);
-      if (!user) return json(res, { error: "未登录或令牌过期" }, 401);
+        // 登录
+        if (pathname === '/auth/login' && req.method === 'POST') {
+            const { username, password } = req.body || {};
+            if (!username || !password) return json(res, { error: "请填写用户名和密码" }, 400);
 
-      return json(res, {
-        user: {
-          username: user.username,
-          nickname: user.nickname,
-          is_vip: !!user.is_vip,
-          free_quota: user.free_quota,
-          used_quota: user.used_quota,
-          remaining: Math.max(0, user.free_quota - user.used_quota)
-        }
-      });
-    }
+            const uname = username.toLowerCase();
+            let user = await db.get('user:' + uname);
+            if (typeof user === 'string') user = JSON.parse(user);
+            const pwdHash = simpleHash(password);
 
-    // ==========================================
-    //  💬 代理聊天（带账号额度校验）
-    // ==========================================
-    if (pathname === '/api/chat' && req.method === 'POST') {
-      const user = getUser(req, db);
-      if (!user) return json(res, { error: "请先登录" }, 401);
-      if (user.is_banned) return json(res, { error: "账号已被封禁" }, 403);
-
-      if (!API_KEY) {
-        return json(res, { error: "服务器未配置 API 密钥，请联系管理员" }, 500);
-      }
-
-      // VIP 不限额度
-      if (!user.is_vip) {
-        const remaining = user.free_quota - user.used_quota;
-        if (remaining <= 0) {
-          return json(res, {
-            error: {
-              message: `免费额度已用完（${user.used_quota}/${user.free_quota}条）！`,
-              type: "quota_exceeded"
+            if (!user || user.password_hash !== pwdHash) {
+                return json(res, { error: "用户名或密码错误" }, 401);
             }
-          }, 429);
+
+            const token = generateToken();
+            await db.set('token:' + token, uname, { ex: 30 * 24 * 60 * 60 });
+
+            return json(res, {
+                success: true,
+                token: token,
+                user: {
+                    username: uname,
+                    nickname: user.nickname,
+                    free_quota: user.free_quota,
+                    used_quota: user.used_quota
+                }
+            });
         }
-      }
 
-      const body = req.body || {};
+        // 获取当前用户
+        if (pathname === '/auth/me' && req.method === 'GET') {
+            const user = await getUser(req);
+            if (!user) return json(res, { error: "未登录或令牌过期" }, 401);
 
-      // 转发给真实 API
-      const apiRes = await fetch(API_URL, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Authorization": `Bearer ${API_KEY}`
-        },
-        body: JSON.stringify({
-          model: API_MODEL,
-          messages: body.messages,
-          temperature: body.temperature || 0.9,
-          stream: false
-        })
-      });
+            return json(res, {
+                user: {
+                    username: user.username,
+                    nickname: user.nickname,
+                    free_quota: user.free_quota,
+                    used_quota: user.used_quota,
+                    remaining: Math.max(0, user.free_quota - user.used_quota)
+                }
+            });
+        }
 
-      const apiData = await apiRes.json();
+        // 聊天代理
+        if (pathname === '/api/chat' && req.method === 'POST') {
+            const user = await getUser(req);
+            if (!user) return json(res, { error: "请先登录" }, 401);
 
-      // 成功才扣额度
-      if (apiData.choices && apiData.choices.length > 0 && !user.is_vip) {
-        db.users[user.username].used_quota += 1;
-        saveDB(db);
+            if (!API_KEY) {
+                return json(res, { error: "服务器未配置 API 密钥" }, 500);
+            }
 
-        apiData._panda_quota = {
-          used: user.used_quota + 1,
-          remaining: user.free_quota - user.used_quota - 1,
-          total: user.free_quota
-        };
-      }
+            const remaining = user.free_quota - user.used_quota;
+            if (remaining <= 0) {
+                return json(res, {
+                    error: {
+                        message: "免费额度已用完！请去设置填入自己的 API Key。",
+                        type: "quota_exceeded"
+                    }
+                }, 429);
+            }
 
-      return json(res, apiData);
+            const body = req.body || {};
+
+            const apiRes = await fetch(API_URL, {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                    "Authorization": "Bearer " + API_KEY
+                },
+                body: JSON.stringify({
+                    model: API_MODEL,
+                    messages: body.messages,
+                    temperature: body.temperature || 0.9,
+                    stream: false
+                })
+            });
+
+            const apiData = await apiRes.json();
+
+            if (apiData.choices && apiData.choices.length > 0) {
+                user.used_quota += 1;
+                await db.set('user:' + user.username, JSON.stringify({
+                    password_hash: user.password_hash,
+                    nickname: user.nickname,
+                    free_quota: user.free_quota,
+                    used_quota: user.used_quota
+                }));
+
+                apiData._panda_quota = {
+                    used: user.used_quota,
+                    remaining: user.free_quota - user.used_quota,
+                    total: user.free_quota
+                };
+            }
+
+            return json(res, apiData);
+        }
+
+        // 服务状态
+        return json(res, {
+            service: "时空机 Cloud v2.0",
+            status: "online"
+        });
+
+    } catch (e) {
+        return json(res, { error: "服务器内部错误: " + e.message }, 500);
     }
-
-    // ==========================================
-    //  📊 服务状态
-    // ==========================================
-    return json(res, {
-      service: "时空机 Cloud v1.0",
-      status: "online",
-      users: Object.keys(db.users).length
-    });
-
-  } catch (e) {
-    return json(res, { error: "服务器内部错误: " + e.message }, 500);
-  }
 };
