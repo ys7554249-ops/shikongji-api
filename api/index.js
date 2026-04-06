@@ -1,11 +1,14 @@
-const { Redis } = require('@upstash/redis');
+const { createClient } = require('redis');
 
-let redis;
-function getRedis() {
-    if (!redis) {
-        redis = Redis.fromEnv();
+let redisClient = null;
+
+async function getRedis() {
+    if (!redisClient || !redisClient.isOpen) {
+        redisClient = createClient({ url: process.env.REDIS_URL });
+        redisClient.on('error', (err) => console.log('Redis error:', err));
+        await redisClient.connect();
     }
-    return redis;
+    return redisClient;
 }
 
 const API_KEY = process.env.API_KEY || "";
@@ -37,15 +40,15 @@ function json(res, data, status = 200) {
     res.status(status).json(data);
 }
 
-async function getUser(req) {
+async function getUser(req, db) {
     const auth = req.headers.authorization;
     if (!auth || !auth.startsWith('Bearer ')) return null;
     const token = auth.substring(7);
-    const db = getRedis();
     const username = await db.get('token:' + token);
     if (!username) return null;
-    const user = await db.get('user:' + username);
-    if (!user) return null;
+    const userData = await db.get('user:' + username);
+    if (!userData) return null;
+    const user = JSON.parse(userData);
     return { ...user, username: username };
 }
 
@@ -59,7 +62,13 @@ module.exports = async function handler(req, res) {
 
     const url = new URL(req.url, `http://${req.headers.host}`);
     const pathname = url.pathname;
-    const db = getRedis();
+
+    let db;
+    try {
+        db = await getRedis();
+    } catch (e) {
+        return json(res, { error: "数据库连接失败: " + e.message }, 500);
+    }
 
     try {
         // 注册
@@ -84,7 +93,7 @@ module.exports = async function handler(req, res) {
             await db.set('user:' + uname, JSON.stringify(userData));
 
             const token = generateToken();
-            await db.set('token:' + token, uname, { ex: 30 * 24 * 60 * 60 });
+            await db.set('token:' + token, uname, { EX: 30 * 24 * 60 * 60 });
 
             return json(res, {
                 success: true,
@@ -105,16 +114,18 @@ module.exports = async function handler(req, res) {
             if (!username || !password) return json(res, { error: "请填写用户名和密码" }, 400);
 
             const uname = username.toLowerCase();
-            let user = await db.get('user:' + uname);
-            if (typeof user === 'string') user = JSON.parse(user);
+            const userData = await db.get('user:' + uname);
+            if (!userData) return json(res, { error: "用户名或密码错误" }, 401);
+
+            const user = JSON.parse(userData);
             const pwdHash = simpleHash(password);
 
-            if (!user || user.password_hash !== pwdHash) {
+            if (user.password_hash !== pwdHash) {
                 return json(res, { error: "用户名或密码错误" }, 401);
             }
 
             const token = generateToken();
-            await db.set('token:' + token, uname, { ex: 30 * 24 * 60 * 60 });
+            await db.set('token:' + token, uname, { EX: 30 * 24 * 60 * 60 });
 
             return json(res, {
                 success: true,
@@ -130,7 +141,7 @@ module.exports = async function handler(req, res) {
 
         // 获取当前用户
         if (pathname === '/auth/me' && req.method === 'GET') {
-            const user = await getUser(req);
+            const user = await getUser(req, db);
             if (!user) return json(res, { error: "未登录或令牌过期" }, 401);
 
             return json(res, {
@@ -146,25 +157,17 @@ module.exports = async function handler(req, res) {
 
         // 聊天代理
         if (pathname === '/api/chat' && req.method === 'POST') {
-            const user = await getUser(req);
+            const user = await getUser(req, db);
             if (!user) return json(res, { error: "请先登录" }, 401);
 
-            if (!API_KEY) {
-                return json(res, { error: "服务器未配置 API 密钥" }, 500);
-            }
+            if (!API_KEY) return json(res, { error: "服务器未配置 API 密钥" }, 500);
 
             const remaining = user.free_quota - user.used_quota;
             if (remaining <= 0) {
-                return json(res, {
-                    error: {
-                        message: "免费额度已用完！请去设置填入自己的 API Key。",
-                        type: "quota_exceeded"
-                    }
-                }, 429);
+                return json(res, { error: { message: "免费额度已用完", type: "quota_exceeded" } }, 429);
             }
 
             const body = req.body || {};
-
             const apiRes = await fetch(API_URL, {
                 method: "POST",
                 headers: {
@@ -201,12 +204,9 @@ module.exports = async function handler(req, res) {
         }
 
         // 服务状态
-        return json(res, {
-            service: "时空机 Cloud v2.0",
-            status: "online"
-        });
+        return json(res, { service: "时空机 Cloud v2.0", status: "online" });
 
     } catch (e) {
-        return json(res, { error: "服务器内部错误: " + e.message }, 500);
+        return json(res, { error: "服务器错误: " + e.message }, 500);
     }
 };
